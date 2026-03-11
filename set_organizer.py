@@ -86,9 +86,10 @@ def organize_from_json():
             if os.path.exists(src_path) and not os.path.exists(dest_path):
                 # If sufficient storage: shutil.copy2(src_path, dest_path)
                 # If no storage:
-                os.symlin(os.path.abspath(src_path), dest_path)
+                os.symlink(os.path.abspath(src_path), dest_path)
 
     print(f"Done! Data split and organized in {OUTPUT_BASE_DIR}")
 
 if __name__ == "__main__":
     organize_from_json()
+
