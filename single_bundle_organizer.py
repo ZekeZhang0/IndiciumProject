@@ -1,109 +1,400 @@
-import pandas as pd
-import shutil
-import os
-import json
-from pathlib import Path
-from sklearn.model_selection import train_test_split
+# CheXpert+ Multi-Label Chest X-Ray Classification — Training Pipeline
 
-JSON_LABELS_PATH = "report_fixed.json"
-BUNDLE_PATH = "chexpert/bundle1"
-OUTPUT_BASE_DIR = "./organized_data/"
+## Overview
 
-PATHO_LABELS = [
-    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", 
-    "Enlarged Cardiomediastinum", "Fracture", "Lung Lesion", "Lung Opacity", 
-    "Pleural Effusion", "Pleural Other", "Pneumonia", "Pneumothorax", 
-    "Support Devices"
-]
+`train_chexpert.py` implements a complete **PyTorch training pipeline** for multi-label chest X-ray pathology classification on the [CheXpert+](https://stanfordaimi.azurewebsites.net/datasets/5158c524-d3ab-4e02-96e9-6ee9efc110a1) dataset using **DenseNet121** with ImageNet transfer learning.
 
-def get_patient_id(path_obj):
-    # path_obj is a pathlib Path. Structure: .../train/patientXXXXX/studyX/viewX.png
-    # We want the parent of the parent of the file.
-    return path_obj.parts[-3] 
+Given a set of chest X-ray PNG images organised into `train / val / test` splits (produced by the companion data organisation scripts), this pipeline:
 
-def organize_single_bundle():
-    # 1. Load JSON into a dictionary for fast lookup
-    print("Loading JSON labels...")
-    with open(JSON_LABELS_PATH, 'r') as f:
-        json_data = json.load(f)
-    
-    # Create a lookup table where key is the 'path_to_image'
-    label_lookup = {item['path_to_image']: item for item in json_data}
+1. Loads images and reconstructs a **14-dimensional multi-label target vector** per image from `report_fixed.json`
+2. Applies **data augmentation** during training and standard normalisation during evaluation
+3. Fine-tunes a **pretrained DenseNet121** via transfer learning
+4. Trains with **Binary Cross-Entropy loss** (appropriate for multi-label problems)
+5. Evaluates per-class and macro-average **AUC-ROC** after every epoch
+6. Saves the **best checkpoint** (by validation AUC) and produces a final test report
 
-    # 2. Find all PNGs in the bundle
-    print(f"Scanning {BUNDLE_PATH} for images...")
-    bundle_path = Path(BUNDLE_PATH)
-    image_files = list(bundle_path.rglob("*.png"))
-    
-    if not image_files:
-        print("No images found! Check your BUNDLE_PATH.")
-        return
+---
 
-    # 3. Extract Unique Patients
-    patient_to_files = {}
-    for img_path in image_files:
-        pid = get_patient_id(img_path)
-        if pid not in patient_to_files:
-            patient_to_files[pid] = []
-        patient_to_files[pid].append(img_path)
-    
-    unique_patients = list(patient_to_files.keys())
-    print(f"Found {len(unique_patients)} unique patients.")
+## What Problem Does This Solve?
 
-    # 4. Split Patients (70/10/20)
-    train_val, test_pts = train_test_split(unique_patients, test_size=0.20, random_state=42)
-    train_pts, val_pts = train_test_split(train_val, test_size=0.125, random_state=42)
+A single chest X-ray can show **multiple pathologies simultaneously** (e.g. a patient may have both Atelectasis and Pleural Effusion). This is a **multi-label classification** problem — not a standard single-class problem — so each of the 14 output nodes is treated independently with its own sigmoid activation and binary cross-entropy loss.
 
-    split_map = {
-        **{p: 'train' for p in train_pts},
-        **{p: 'val' for p in val_pts},
-        **{p: 'test' for p in test_pts}
-    }
+The 14 target labels are:
 
-    # 5. Process Files
-    print("Organizing files...")
-    count = 0
-    for pid, files in patient_to_files.items():
-        current_split = split_map[pid]
-        
-        for src_path in files:
-            # Prepare path for JSON lookup
-            # We need to convert: 'chexpert/bundle1/train/p1/s1/v1.png' 
-            # to match JSON: 'train/p1/s1/v1.jpg'
-            path_parts = src_path.parts
-            # Find index of 'train' or 'valid' to match CheXpert standard
-            try:
-                start_idx = path_parts.index("train")
-            except ValueError:
-                start_idx = path_parts.index("valid")
-            
-            json_match_path = "/".join(path_parts[start_idx:]).replace(".png", ".jpg")
-            
-            # Find Label
-            label_data = label_lookup.get(json_match_path)
-            primary_label = "No_Finding"
-            
-            if label_data:
-                for l in PATHO_LABELS:
-                    if label_data.get(l) == 1.0:
-                        primary_label = l.replace(" ", "_")
-                        break
-            
-            # Create destination
-            dest_folder = Path(OUTPUT_BASE_DIR) / current_split / primary_label
-            dest_folder.mkdir(parents=True, exist_ok=True)
-            
-            # Unique filename (patient_study_view.png)
-            new_name = "_".join(src_path.parts[-3:])
-            dest_path = dest_folder / new_name
+| # | Label | # | Label |
+|---|-------|---|-------|
+| 0 | Atelectasis | 7 | Lung Opacity |
+| 1 | Cardiomegaly | 8 | Pleural Effusion |
+| 2 | Consolidation | 9 | Pleural Other |
+| 3 | Edema | 10 | Pneumonia |
+| 4 | Enlarged Cardiomediastinum | 11 | Pneumothorax |
+| 5 | Fracture | 12 | Support Devices |
+| 6 | Lung Lesion | 13 | No Finding |
 
-            # Copy or Symlink
-            if not dest_path.exists():
-                # Alternatively, use shutil.copy2
-                os.symlink(src_path.absolute(), dest_path)
-                count += 1
+> **No Finding** is set to `1` only when all other 13 labels are `0`.
 
-    print(f"Done! Processed {count} images into {OUTPUT_BASE_DIR}")
+---
 
-if __name__ == "__main__":
-    organize_single_bundle()
+## Prerequisites
+
+### Python Version
+Python 3.8 or higher is required.
+
+### Hardware
+- A **GPU is strongly recommended** (NVIDIA CUDA or Apple Silicon MPS).
+- CPU-only training is supported but will be significantly slower.
+- Minimum ~8 GB RAM for a batch size of 32 at 224×224.
+
+### Required Files
+
+Before running training, make sure the following are in place:
+
+```
+project/
+├── train_chexpert.py          ← this script
+├── report_fixed.json          ← label file from labels.zip (CheXpert+)
+└── organized_data/            ← output of the data organisation scripts
+    ├── train/
+    │   ├── Atelectasis/
+    │   ├── Cardiomegaly/
+    │   ├── ...
+    │   └── No_Finding/
+    ├── val/
+    │   └── ...
+    └── test/
+        └── ...
+```
+
+`organized_data/` is generated by running either `organize_from_json.py` or `organize_single_bundle.py` from the data preparation step.
+
+### Python Dependencies
+
+Install all dependencies with:
+
+```bash
+pip install -r requirements_train.txt
+```
+
+Or manually:
+
+```bash
+pip install torch>=2.0.0 torchvision>=0.15.0 numpy>=1.24.0 Pillow>=9.5.0 scikit-learn>=1.3.0
+```
+
+> For GPU support, install the CUDA-enabled version of PyTorch from [https://pytorch.org](https://pytorch.org) before running the above.
+
+---
+
+## File Structure
+
+```
+train_chexpert.py
+│
+├── CONSTANTS
+│   ├── PATHO_LABELS          — ordered list of 14 pathology class names
+│   ├── NUM_CLASSES           — 14
+│   └── IMAGENET_MEAN/STD     — normalisation values for transfer learning
+│
+├── CLASS: CheXpertDataset
+│   ├── __init__
+│   ├── _resolve_labels
+│   ├── __len__
+│   └── __getitem__
+│
+├── FUNCTION: get_transforms
+├── FUNCTION: build_model
+├── FUNCTION: train_one_epoch
+├── FUNCTION: evaluate
+├── FUNCTION: print_per_class_auc
+├── FUNCTION: train               ← main training loop
+├── FUNCTION: predict_single      ← inference helper
+└── FUNCTION: parse_args
+```
+
+---
+
+## Function Reference
+
+### `CheXpertDataset` (class)
+
+A custom PyTorch `Dataset` that loads PNG chest X-ray images and their corresponding multi-label vectors.
+
+**`__init__(self, data_dir, split, transform=None, json_path=None)`**
+
+Initialises the dataset for a given split (`"train"`, `"val"`, or `"test"`).
+
+- Scans `data_dir/{split}/` for all `.png` images across all label subdirectories.
+- If `json_path` is provided and the file exists, it pre-loads the full multi-label lookup table from `report_fixed.json`. This enables each image to carry labels for **all** pathologies it was annotated with, not just the folder it was placed in.
+- Prints the total number of images found for that split.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `data_dir` | `str` | Root directory containing `train/`, `val/`, `test/` subfolders |
+| `split` | `str` | One of `"train"`, `"val"`, `"test"` |
+| `transform` | `torchvision.transforms` | Image transforms to apply (augmentation or normalisation) |
+| `json_path` | `str` \| `None` | Path to `report_fixed.json`. If `None`, falls back to single-label mode |
+
+---
+
+**`_resolve_labels(self, img_path, folder_label)`**
+
+Internal method. Reconstructs the JSON lookup key from an image's filename and retrieves its full multi-label vector.
+
+- Parses the filename (e.g. `patient42_study1_view1_frontal.png`) back into `train/patient42/study1/view1_frontal.jpg` to match the key format used in `report_fixed.json`.
+- If the key is not found in the lookup table (e.g. the JSON was not loaded), falls back gracefully to a single-label vector derived from the folder name.
+
+---
+
+**`__len__(self)`**
+
+Returns the total number of image samples in the split.
+
+---
+
+**`__getitem__(self, idx)`**
+
+Returns a single `(image_tensor, label_tensor)` pair.
+
+- Opens the image as RGB using Pillow.
+- Applies the configured transforms.
+- Returns the label as a `float32` tensor of shape `(14,)`, where each element is `0.0` or `1.0`.
+
+---
+
+### `get_transforms(image_size=224)`
+
+Builds and returns two separate transform pipelines: one for training, one for validation/test.
+
+**Training transforms** (with augmentation):
+1. Resize to `(image_size + 32) × (image_size + 32)`
+2. Random crop to `image_size × image_size`
+3. Random horizontal flip
+4. Random brightness and contrast jitter (±20%)
+5. Convert to tensor
+6. Normalise with ImageNet mean and std
+
+**Validation/Test transforms** (no augmentation):
+1. Resize directly to `image_size × image_size`
+2. Convert to tensor
+3. Normalise with ImageNet mean and std
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image_size` | `int` | `224` | Target image size (both width and height) |
+
+**Returns:** `(train_transform, val_transform)`
+
+---
+
+### `build_model(num_classes=14, pretrained=True)`
+
+Constructs a DenseNet121 model pretrained on ImageNet with a custom multi-label classification head replacing the original single-class output layer.
+
+The original classifier is replaced with a new head: `Linear(in_features → 512) → ReLU → Dropout(0.3) → Linear(512 → num_classes)`. The output is raw logits — no sigmoid is applied here, as that is handled by the loss function during training and applied explicitly during inference.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `num_classes` | `int` | `14` | Number of output nodes |
+| `pretrained` | `bool` | `True` | Whether to load ImageNet weights |
+
+**Returns:** A `torch.nn.Module` ready to be moved to a device.
+
+---
+
+### `train_one_epoch(model, loader, criterion, optimizer, device, epoch)`
+
+Runs a single full pass over the training set (one epoch).
+
+- Sets the model to training mode (`model.train()`).
+- Iterates over batches: forward pass → compute loss → backpropagation → update weights.
+- Prints a progress update every 50 batches showing current batch loss and elapsed time.
+
+**Returns:** Average training loss over all batches (`float`).
+
+---
+
+### `evaluate(model, loader, criterion, device)`
+
+Evaluates the model on a given data loader (validation or test) without updating weights.
+
+- Sets the model to evaluation mode (`model.eval()`) and disables gradient computation.
+- Collects predicted probabilities (via `sigmoid`) and ground-truth labels across all batches.
+- Computes **per-class AUC-ROC**. Classes with no positive samples in the split are assigned `NaN` and excluded from the macro average.
+
+**Returns:** `(avg_loss, macro_auc, per_class_aucs, all_probs, all_labels)`
+
+| Return value | Type | Description |
+|---|---|---|
+| `avg_loss` | `float` | Mean BCE loss across all batches |
+| `macro_auc` | `float` | Average AUC across all valid classes |
+| `per_class_aucs` | `list[float]` | AUC for each of the 14 classes |
+| `all_probs` | `np.ndarray` | Shape `(N, 14)` — predicted probabilities |
+| `all_labels` | `np.ndarray` | Shape `(N, 14)` — ground-truth binary labels |
+
+---
+
+### `print_per_class_auc(aucs)`
+
+Prints a formatted per-class AUC table to stdout, with a simple ASCII bar for visual comparison across classes.
+
+Example output:
+```
+  Per-Class AUC:
+    Atelectasis                    0.7823  ███████████████
+    Cardiomegaly                   0.8910  █████████████████
+    ...
+    No Finding                      N/A   N/A
+```
+
+---
+
+### `train(args)`
+
+The main training orchestration function. Called by the entry point with parsed arguments.
+
+Steps performed:
+1. Detects the best available device (CUDA GPU → Apple MPS → CPU).
+2. Creates `CheXpertDataset` instances and `DataLoader`s for train, val, and test.
+3. Builds DenseNet121 with pretrained ImageNet weights.
+4. Initialises `BCEWithLogitsLoss`, `AdamW` optimiser, and `CosineAnnealingLR` scheduler.
+5. Runs the training loop for `args.epochs` epochs:
+   - Trains for one epoch with `train_one_epoch`
+   - Evaluates on the validation set with `evaluate`
+   - Steps the learning rate scheduler
+   - Saves the model checkpoint if validation AUC improved
+6. After all epochs, loads the best checkpoint and runs final evaluation on the **test set**.
+7. Prints a full classification report (precision, recall, F1 at threshold 0.5) per class.
+8. Saves the per-epoch loss and AUC history to `checkpoints/training_history.json`.
+
+---
+
+### `predict_single(image_path, model_path, image_size=224, threshold=0.5)`
+
+Standalone inference helper. Loads a saved DenseNet121 checkpoint and runs prediction on a single image.
+
+- Prints a ranked list of all 14 labels with their predicted probabilities.
+- Labels above `threshold` are marked with `✓`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image_path` | `str` | — | Path to the input PNG image |
+| `model_path` | `str` | — | Path to a `.pth` checkpoint saved during training |
+| `image_size` | `int` | `224` | Must match the size used during training |
+| `threshold` | `float` | `0.5` | Probability cutoff for a positive prediction |
+
+**Returns:** `dict` mapping each label name to its predicted probability.
+
+---
+
+### `parse_args()`
+
+Parses command-line arguments using `argparse`. All arguments have defaults so the script can be run with no arguments.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--data_dir` | `./organized_data/` | Root directory of the organised dataset |
+| `--json_path` | `report_fixed.json` | Path to the multi-label JSON file |
+| `--epochs` | `15` | Number of training epochs |
+| `--batch_size` | `32` | Batch size for all data loaders |
+| `--image_size` | `224` | Input image resolution (both height and width) |
+| `--lr` | `1e-4` | Initial learning rate for AdamW |
+| `--num_workers` | `4` | Number of parallel data loading workers |
+| `--output_dir` | `./checkpoints/` | Directory where checkpoints and history are saved |
+
+---
+
+## Usage
+
+### 1. Basic Training (all defaults)
+
+```bash
+python train_chexpert.py
+```
+
+Trains DenseNet121 for 15 epochs at 224×224, batch size 32. Saves the best model to `./checkpoints/best_densenet121.pth`.
+
+### 2. Custom Training Run
+
+```bash
+python train_chexpert.py \
+  --epochs 20 \
+  --batch_size 32 \
+  --image_size 224 \
+  --lr 1e-4 \
+  --data_dir ./organized_data/ \
+  --json_path report_fixed.json \
+  --output_dir ./checkpoints/
+```
+
+### 3. Reduce Memory Usage on Local Machines
+
+```bash
+python train_chexpert.py --batch_size 16 --num_workers 2
+```
+
+### 4. Run Inference on a Single Image
+
+```python
+from train_chexpert import predict_single
+
+results = predict_single(
+    image_path="path/to/your/image.png",
+    model_path="./checkpoints/best_densenet121.pth",
+    image_size=224,
+    threshold=0.5
+)
+```
+
+---
+
+## Output Files
+
+After training completes, the following files are written to `--output_dir` (default: `./checkpoints/`):
+
+| File | Description |
+|------|-------------|
+| `best_densenet121.pth` | Best model checkpoint (by validation AUC). Contains `state_dict`, `epoch`, `val_auc`, and `labels`. |
+| `training_history.json` | Per-epoch `train_loss`, `val_loss`, and `val_auc` for plotting or further analysis. |
+
+---
+
+## Design Decisions
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Architecture | DenseNet121 | Widely validated on CheXpert and CheXpert+; dense connections encourage feature reuse, which is effective for subtle radiological findings. |
+| Loss function | `BCEWithLogitsLoss` | Standard for multi-label classification. Treats each class independently. More numerically stable than applying `sigmoid` then `BCELoss`. |
+| Optimiser | `AdamW` (weight decay 1e-4) | Decoupled weight decay prevents overfitting more effectively than plain Adam, especially on a moderate-sized dataset. |
+| Scheduler | `CosineAnnealingLR` | Smoothly decays the learning rate from `lr` to `1e-6` over the full training run. Avoids abrupt drops and generally outperforms step decay on medical imaging tasks. |
+| Evaluation metric | AUC-ROC | Standard benchmark metric for CheXpert. Robust to class imbalance, which is common in pathology datasets where most patients do not have a given condition. |
+| Fallback labelling | Single-label from folder name | Ensures the dataset is still usable even if `report_fixed.json` is unavailable or a key is missing. |
+
+---
+
+## Connection to Data Preparation Scripts
+
+This training script is designed to work directly with the output of the two data organisation scripts:
+
+- `organize_from_json.py` — organises images from multiple bundles using `report_fixed.json`
+- `organize_single_bundle.py` — organises images from a single bundle directory
+
+Both scripts produce the same `organized_data/train/val/test/<label>/` folder structure that `CheXpertDataset` expects. The filename convention (`patientXXX_studyX_viewX.png`) is also preserved from those scripts, which is what `_resolve_labels` uses to reconstruct the JSON lookup key.
+
+---
+
+## Troubleshooting
+
+**`No images found` / empty dataset**
+Verify that `--data_dir` points to the correct location and that subdirectories like `train/Atelectasis/` contain `.png` files.
+
+**`KeyError` during label lookup**
+The filename-to-JSON-key reconstruction assumes the naming convention produced by the data organisation scripts. If your filenames differ, inspect the `_resolve_labels` method.
+
+**Out of memory on GPU**
+Reduce `--batch_size` (try `16` or `8`).
+
+**Slow training on CPU**
+Reduce `--num_workers` to `0` on Windows, or use a smaller subset of the data for initial prototyping.
+
+**`NaN` AUC for a class**
+This class has no positive samples in the validation split. It is automatically excluded from the macro AUC calculation.
